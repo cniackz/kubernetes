@@ -91,9 +91,9 @@ func loadVolumeData(dir string, fileName string) (map[string]string, error) {
 	return data, nil
 }
 
-// findGlobalMountDataFromPodMount locates the CSI global mount that the given
-// pod-local mount is bound to, and returns its data directory along with the
-// parsed vol_data.json stored next to it.
+// findGlobalMountDataFromPodMount locates the CSI global mount of volume
+// specVolID that the given pod-local mount is bound to, and returns its data
+// directory along with the parsed vol_data.json stored next to it.
 //
 // Used as a fallback when the pod-local vol_data.json is missing or corrupt
 // during kubelet volume reconstruction, see issue #101791. The mount table is
@@ -104,13 +104,16 @@ func loadVolumeData(dir string, fileName string) (map[string]string, error) {
 // ambiguous: an inline ephemeral volume is named after its entry in the pod
 // spec, which is not unique on the node, and it never stages a global mount of
 // its own, so every name match it produced would be someone else's volume.
-func findGlobalMountDataFromPodMount(host volume.VolumeHost, mountPath string) (string, map[string]string, error) {
+func findGlobalMountDataFromPodMount(host volume.VolumeHost, mountPath, specVolID string) (string, map[string]string, error) {
 	podMountPath := filepath.Join(mountPath, "mount")
 	refs, err := volumeutil.GetReliableMountRefs(host.GetMounter(), podMountPath)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to read mount references for %q: %w", podMountPath, err)
 	}
 
+	var unnamedDir string
+	var unnamedData map[string]string
+	candidates := 0
 	for _, ref := range refs {
 		if filepath.Base(ref) != globalMountInGlobalPath {
 			continue
@@ -130,9 +133,22 @@ func findGlobalMountDataFromPodMount(host volume.VolumeHost, mountPath string) (
 			klog.V(4).Info(log("skipping mount reference %s, volume data names no driver or handle", ref))
 			continue
 		}
-		return dir, data, nil
+		// References match by superblock and root, so every volume staged from one export shows up here.
+		// A file from a kubelet older than this feature names no volume and is trusted only when it is the only one.
+		candidates++
+		switch got := data[volDataKey.specVolID]; got {
+		case specVolID:
+			return dir, data, nil
+		case "":
+			unnamedDir, unnamedData = dir, data
+		default:
+			klog.V(4).Info(log("skipping mount reference %s, it belongs to volume %q", ref, got))
+		}
 	}
-	return "", nil, fmt.Errorf("no CSI global mount is bind mounted at %q", podMountPath)
+	if candidates == 1 && unnamedDir != "" {
+		return unnamedDir, unnamedData, nil
+	}
+	return "", nil, fmt.Errorf("no CSI global mount of volume %q among the %d bind mounted at %q", specVolID, candidates, podMountPath)
 }
 
 func getCSISourceFromSpec(spec *volume.Spec) (*api.CSIPersistentVolumeSource, error) {
